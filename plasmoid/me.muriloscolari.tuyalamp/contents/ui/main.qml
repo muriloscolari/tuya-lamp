@@ -8,7 +8,8 @@ import org.kde.kirigami as Kirigami
 PlasmoidItem {
     id: root
 
-    readonly property string apiBase: "http://127.0.0.1:8765"
+    readonly property string apiBase: "http://127.0.0.1:18765"
+    readonly property url bulbIconUrl: Qt.resolvedUrl("../icons/tuya-lamp.svg")
 
     property bool daemonOnline: false
     property bool configured: false
@@ -21,6 +22,7 @@ PlasmoidItem {
     property int lampSat: 100
     property double dragLockUntil: 0
 
+    preferredRepresentation: compactRepresentation
     switchWidth: Kirigami.Units.gridUnit * 16
     switchHeight: Kirigami.Units.gridUnit * 18
 
@@ -83,7 +85,7 @@ PlasmoidItem {
     }
 
     Timer {
-        interval: root.expanded ? 1500 : 4000
+        interval: root.expanded ? 1500 : 3500
         running: true
         repeat: true
         triggeredOnStart: true
@@ -100,6 +102,14 @@ PlasmoidItem {
                     (lampOn ? ("Ligada • Brilho " + lampBright + "%") : "Desligada"))
 
     compactRepresentation: MouseArea {
+        id: compactRoot
+        implicitWidth: Kirigami.Units.iconSizes.medium
+        implicitHeight: Kirigami.Units.iconSizes.medium
+        Layout.minimumWidth: Kirigami.Units.iconSizes.smallMedium
+        Layout.minimumHeight: Kirigami.Units.iconSizes.smallMedium
+        Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+        Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+
         acceptedButtons: Qt.LeftButton | Qt.MiddleButton
         hoverEnabled: true
 
@@ -113,19 +123,19 @@ PlasmoidItem {
 
         Kirigami.Icon {
             anchors.centerIn: parent
-            width: Math.min(parent.width, parent.height) * 0.8
+            width: Math.min(parent.width, parent.height) * 0.86
             height: width
-            source: "lightbulb"
-            opacity: root.daemonOnline ? (root.lampOn ? 1.0 : 0.45) : 0.25
+            source: root.bulbIconUrl
+            opacity: root.daemonOnline ? (root.lampOn ? 1.0 : 0.45) : 0.3
         }
 
         Rectangle {
-            width: Math.max(6, parent.width * 0.24)
+            width: Math.max(7, Math.min(parent.width, parent.height) * 0.28)
             height: width
             radius: width / 2
             anchors.right: parent.right
             anchors.bottom: parent.bottom
-            anchors.margins: 2
+            anchors.margins: 1
             color: root.daemonOnline ? root.currentPreviewColor() : Kirigami.Theme.negativeTextColor
             border.width: 1
             border.color: Kirigami.Theme.backgroundColor
@@ -149,10 +159,19 @@ PlasmoidItem {
                 spacing: Kirigami.Units.smallSpacing
 
                 Rectangle {
-                    width: 16
-                    height: 16
-                    radius: 8
+                    width: 28
+                    height: 28
+                    radius: 14
                     color: root.daemonOnline ? root.currentPreviewColor() : Kirigami.Theme.negativeTextColor
+                    border.width: 1
+                    border.color: Qt.rgba(1, 1, 1, 0.25)
+
+                    Kirigami.Icon {
+                        anchors.centerIn: parent
+                        width: 18
+                        height: 18
+                        source: root.bulbIconUrl
+                    }
                 }
 
                 ColumnLayout {

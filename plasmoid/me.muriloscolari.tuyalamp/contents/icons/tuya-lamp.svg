@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bulbGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffd54f"/>
+      <stop offset="50%" stop-color="#ff9800"/>
+      <stop offset="100%" stop-color="#7c5cff"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 6C19.85 6 10 15.85 10 28c0 7.62 3.88 14.34 9.78 18.28 1.54 1.03 2.47 2.75 2.47 4.6V52c0 1.1.9 2 2 2h15.5c1.1 0 2-.9 2-2v-1.12c0-1.85.93-3.57 2.47-4.6C50.12 42.34 54 35.62 54 28 54 15.85 44.15 6 32 6z" fill="url(#bulbGlow)" stroke="#ffffff" stroke-width="2.5" stroke-linejoin="round"/>
+  <path d="M25 56h14a2 2 0 0 1 0 4H25a2 2 0 0 1 0-4zm3 5h8a1.5 1.5 0 0 1 0 3h-8a1.5 1.5 0 0 1 0-3z" fill="#cfd8dc"/>
+  <path d="M26 28c0-3.31 2.69-6 6-6" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+</svg>

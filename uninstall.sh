@@ -24,11 +24,15 @@ fi
 
 echo "==> Parando e desabilitando serviço tuya-lampd..."
 systemctl disable --now tuya-lampd.service >/dev/null 2>&1 || true
+systemctl reset-failed tuya-lampd.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/tuya-lampd.service
 systemctl daemon-reload
 
-echo "==> Removendo binários..."
+echo "==> Removendo binários, ícones e atalho..."
 rm -f /usr/local/bin/tuya-lampd /usr/local/bin/tuya-lamp
+rm -f /usr/share/icons/hicolor/scalable/apps/tuya-lamp.svg
+rm -f "$USER_HOME/.local/share/icons/hicolor/scalable/apps/tuya-lamp.svg"
+rm -f "$USER_HOME/.local/share/applications/tuya-lamp.desktop"
 
 if command -v kpackagetool6 >/dev/null 2>&1; then
     echo "==> Removendo widget Plasmoid ($PLASMOID_ID)..."
