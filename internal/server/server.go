@@ -5,14 +5,18 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
 
+	"github.com/muriloscolari/tuya-lamp/internal/ddp"
 	"github.com/muriloscolari/tuya-lamp/internal/lamp"
 	"github.com/muriloscolari/tuya-lamp/internal/p2"
 	"github.com/muriloscolari/tuya-lamp/internal/radio"
@@ -63,6 +67,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
 	s.mux.HandleFunc("POST /api/command", s.handleCommand)
 	s.mux.HandleFunc("GET /api/events", s.handleEvents)
+	s.mux.HandleFunc("GET /api/openrgb", s.handleOpenRGBGet)
+	s.mux.HandleFunc("POST /api/openrgb", s.handleOpenRGBPost)
+	s.mux.HandleFunc("POST /api/openrgb/register", s.handleOpenRGBRegister)
 	s.mux.HandleFunc("POST /api/setup/capture", s.handleCapture)
 	s.mux.HandleFunc("POST /api/setup/qr", s.handleQRStart)
 	s.mux.HandleFunc("POST /api/setup/qr/poll", s.handleQRPoll)
@@ -92,6 +99,63 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleOpenRGBGet(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.ctrl.Status().OpenRGB)
+}
+
+func (s *Server) handleOpenRGBPost(w http.ResponseWriter, r *http.Request) {
+	var patch lamp.OpenRGBConfigPatch
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
+		return
+	}
+	st, err := s.ctrl.SetOpenRGBConfig(patch)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func parseListenHostPort(listenAddr string) (string, int) {
+	host := "127.0.0.1"
+	port := ddp.DefaultPort
+	if listenAddr == "" {
+		return host, port
+	}
+	h, pStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return host, port
+	}
+	if h != "" && h != "0.0.0.0" {
+		host = h
+	}
+	if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+		port = p
+	}
+	return host, port
+}
+
+func (s *Server) handleOpenRGBRegister(w http.ResponseWriter, r *http.Request) {
+	st := s.ctrl.Status()
+	host, port := parseListenHostPort(st.OpenRGB.ListenAddr)
+	res, err := ddp.RegisterDevice("", st.Name, host, port, 1, 1000, false)
+	if err != nil {
+		if errors.Is(err, ddp.ErrOpenRGBRunning) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                 true,
+		"already_configured": res.AlreadyConfigured,
+		"config_path":        res.ConfigPath,
+		"message":            res.Message,
+	})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {

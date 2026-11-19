@@ -31,6 +31,73 @@ function updateOrb(st) {
   }
 }
 
+function intervalLabel(ms) {
+  const hz = (1000 / ms).toFixed(1);
+  return `${ms} ms (~${hz} Hz)`;
+}
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function renderOpenRGB(st) {
+  const o = st.openrgb;
+  if (!o) return;
+  const cfg = o.config || {};
+
+  const toggleBtn = $("openrgb-toggle");
+  toggleBtn.classList.toggle("on", !!cfg.enabled);
+  toggleBtn.textContent = cfg.enabled ? "Ativado" : "Desativado";
+
+  const dot = $("openrgb-dot");
+  const rgb = o.last_rgb || [0, 0, 0];
+  if (o.connected) {
+    const color = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+    dot.style.background = color;
+    dot.style.boxShadow = `0 0 10px ${color}`;
+  } else {
+    dot.style.background = "#363e52";
+    dot.style.boxShadow = "none";
+  }
+
+  let statusText = "Aguardando OpenRGB";
+  if (o.last_error) {
+    statusText = `Erro DDP: ${o.last_error}`;
+  } else if (o.streaming) {
+    statusText = `Sincronizando (${o.packets_rx} rx / ${o.frames_tx} ble)`;
+  } else if (o.connected && !cfg.enabled) {
+    statusText = "OpenRGB conectado (pausado)";
+  } else if (o.connected && !st.state.on) {
+    statusText = "OpenRGB conectado (lâmpada desligada)";
+  } else if (o.connected) {
+    statusText = `OpenRGB conectado (${o.listen_addr || "127.0.0.1:4048"})`;
+  } else if (o.listen_addr) {
+    statusText = `Aguardando OpenRGB (${o.listen_addr})`;
+  }
+  $("openrgb-status").textContent = statusText;
+
+  if (o.listen_addr && o.listen_addr.includes(":")) {
+    const parts = o.listen_addr.split(":");
+    const port = parts.pop();
+    const host = parts.join(":");
+    $("ddp-spec-ip").textContent = host === "0.0.0.0" || !host ? "127.0.0.1" : host;
+    $("ddp-spec-port").textContent = port || "4048";
+  }
+
+  if (Date.now() > dragLockUntil) {
+    const mb = cfg.max_bright ?? 100;
+    const mi = cfg.min_interval_ms ?? 40;
+    $("openrgb-bright-range").value = mb;
+    $("openrgb-bright-val").textContent = `${mb}%`;
+    $("openrgb-interval-range").value = mi;
+    $("openrgb-interval-val").textContent = intervalLabel(mi);
+  }
+
+  const blackMode = cfg.black_mode === "off" ? "off" : "dim";
+  $("black-dim-btn").classList.toggle("active", blackMode === "dim");
+  $("black-off-btn").classList.toggle("active", blackMode === "off");
+}
+
 function render(st) {
   currentStatus = st;
   $("lamp-name").textContent = st.name || "Zinnia Crux CR90";
@@ -41,7 +108,8 @@ function render(st) {
     $("lamp-meta").textContent = `Erro: ${st.last_error}`;
   } else {
     const modeStr = st.state.mode === "color" ? `Cor ${st.state.hue}°` : `Branco ${st.state.temp}%`;
-    $("lamp-meta").textContent = `Nó ${st.node} • ${st.state.on ? "Ligada" : "Desligada"} • ${modeStr}`;
+    const syncTag = st.openrgb && st.openrgb.streaming && st.state.on ? " • OpenRGB Sync" : "";
+    $("lamp-meta").textContent = `Nó ${st.node} • ${st.state.on ? "Ligada" : "Desligada"} • ${modeStr}${syncTag}`;
   }
 
   const pbtn = $("power-btn");
@@ -65,10 +133,21 @@ function render(st) {
     $("sat-val").textContent = `${st.state.sat}%`;
   }
   updateOrb(st);
+  renderOpenRGB(st);
 }
 
 async function sendCommand(payload) {
   const res = await fetch("/api/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (res.ok) render(data);
+}
+
+async function sendOpenRGB(payload) {
+  const res = await fetch("/api/openrgb", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -105,6 +184,36 @@ bindSlider("bright-range", (v) => { $("bright-val").textContent = `${v}%`; }, (v
 bindSlider("temp-range", (v) => { $("temp-val").textContent = tempLabel(v); }, (v) => sendCommand({ action: "temp", temp: v }));
 bindSlider("hue-range", (v) => { $("hue-val").textContent = `${v}°`; }, (v) => sendCommand({ action: "color", hue: v }));
 bindSlider("sat-range", (v) => { $("sat-val").textContent = `${v}%`; }, (v) => sendCommand({ action: "color", sat: v }));
+
+bindSlider("openrgb-bright-range", (v) => { $("openrgb-bright-val").textContent = `${v}%`; }, (v) => sendOpenRGB({ max_bright: v }));
+bindSlider("openrgb-interval-range", (v) => { $("openrgb-interval-val").textContent = intervalLabel(v); }, (v) => sendOpenRGB({ min_interval_ms: v, hold_ms: clamp(v - 5, 15, 180) }));
+
+$("openrgb-toggle").addEventListener("click", () => {
+  const enabled = currentStatus && currentStatus.openrgb && currentStatus.openrgb.config ? !currentStatus.openrgb.config.enabled : true;
+  sendOpenRGB({ enabled });
+});
+
+document.querySelectorAll("[data-black]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    sendOpenRGB({ black_mode: btn.dataset.black });
+  });
+});
+
+$("openrgb-register-btn").addEventListener("click", async () => {
+  const btn = $("openrgb-register-btn");
+  const statusEl = $("openrgb-register-status");
+  btn.disabled = true;
+  statusEl.textContent = "Configurando OpenRGB...";
+  try {
+    const res = await fetch("/api/openrgb/register", { method: "POST" });
+    const data = await res.json();
+    statusEl.textContent = res.ok ? data.message : (data.error || "Erro ao configurar OpenRGB");
+  } catch (e) {
+    statusEl.textContent = `Erro: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 document.querySelectorAll("[data-white]").forEach((btn) => {
   btn.addEventListener("click", () => {

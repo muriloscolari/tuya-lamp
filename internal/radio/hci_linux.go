@@ -42,10 +42,15 @@ var adapterPattern = regexp.MustCompile(`^hci(\d+)$`)
 // Radio provides raw HCI Bluetooth LE advertising and scanning on Linux.
 // Requires CAP_NET_RAW or root.
 type Radio struct {
-	Adapter  string
-	Index    uint16
-	mu       sync.Mutex
-	extended *bool
+	Adapter       string
+	Index         uint16
+	mu            sync.Mutex
+	extended      *bool
+	revSender     [6]byte
+	filterCleared bool
+	advActive     bool
+	eventFd       int
+	idleTimer     *time.Timer
 }
 
 // New creates a Radio bound to adapter (defaults to TUYA_LAMP_ADAPTER or "hci0").
@@ -64,7 +69,13 @@ func New(adapter string) (*Radio, error) {
 	if err != nil {
 		return nil, fmt.Errorf("radio: invalid adapter index: %w", err)
 	}
-	return &Radio{Adapter: adapter, Index: uint16(idx)}, nil
+	var sender [6]byte
+	if _, err := rand.Read(sender[1:]); err != nil {
+		return nil, fmt.Errorf("radio: rand address: %w", err)
+	}
+	sender[0] = 0xC2
+	revSender := [6]byte{sender[5], sender[4], sender[3], sender[2], sender[1], sender[0]}
+	return &Radio{Adapter: adapter, Index: uint16(idx), revSender: revSender, eventFd: -1}, nil
 }
 
 func openHCI(index uint16, filter hciFilter) (int, error) {
@@ -185,8 +196,37 @@ func (r *Radio) detectMode() (bool, error) {
 	return ext, nil
 }
 
+func (r *Radio) closeEventFdLocked() {
+	if r.eventFd >= 0 {
+		syscall.Close(r.eventFd)
+		r.eventFd = -1
+	}
+}
+
+func (r *Radio) ensureEventFdLocked() int {
+	if r.eventFd >= 0 {
+		return r.eventFd
+	}
+	filter := hciFilter{
+		TypeMask:  0x10,
+		EventMask: [2]uint32{0, 1 << 30}, // HCI_EV_LE_META (0x3E)
+		Opcode:    0,
+	}
+	fd, err := openHCI(r.Index, filter)
+	if err != nil {
+		return -1
+	}
+	r.eventFd = fd
+	return fd
+}
+
 func (r *Radio) stopAdvertising(ext bool) error {
+	r.advActive = false
+	r.closeEventFdLocked()
 	if ext {
+		if _, err := r.command(0x39, []byte{0x00, 0x01, 0x01, 0x00, 0x00, 0x00}, true); err == nil {
+			return nil
+		}
 		_, err := r.command(0x39, []byte{0x00, 0x00}, true)
 		return err
 	}
@@ -194,10 +234,160 @@ func (r *Radio) stopAdvertising(ext bool) error {
 	return err
 }
 
-// Advertise broadcasts each 31-byte BLE advertising payload for hold duration from a random address.
+func (r *Radio) scheduleIdleStopLocked(ext bool) {
+	if r.idleTimer != nil {
+		r.idleTimer.Stop()
+	}
+	r.idleTimer = time.AfterFunc(500*time.Millisecond, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.advActive {
+			_ = r.stopAdvertising(ext)
+		}
+	})
+}
+
+func (r *Radio) configureExtAdv(propsLo, filterPolicy byte) error {
+	params := []byte{
+		0x01, propsLo, 0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0x00, 0x07,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, filterPolicy, 0x7F,
+		0x01, 0x00, 0x01, 0x00, 0x00,
+	}
+	if _, err := r.command(0x36, params, false); err != nil {
+		return err
+	}
+	_, err := r.command(0x35, append([]byte{0x01}, r.revSender[:]...), false)
+	return err
+}
+
+func (r *Radio) disconnectHandle(connHandle uint16) {
+	opcode := uint16(0x0406) // OGF 0x01 (Link Control), OCF 0x0006 (HCI_Disconnect)
+	filter := hciFilter{
+		TypeMask:  0x10,
+		EventMask: [2]uint32{(1 << 14) | (1 << 15), 0},
+		Opcode:    opcode,
+	}
+	fd, err := openHCI(r.Index, filter)
+	if err != nil {
+		return
+	}
+	defer syscall.Close(fd)
+
+	pkt := []byte{
+		0x01,
+		byte(opcode), byte(opcode >> 8),
+		0x03,
+		byte(connHandle), byte(connHandle >> 8),
+		0x13, // Remote User Terminated Connection
+	}
+	_, _ = syscall.Write(fd, pkt)
+}
+
+// drainTermEventsLocked checks without blocking if the controller terminated advertising set 1.
+func (r *Radio) drainTermEventsLocked() bool {
+	fd := r.ensureEventFdLocked()
+	if fd < 0 {
+		return false
+	}
+	terminated := false
+	buf := make([]byte, 256)
+	for {
+		n, _, err := syscall.Recvfrom(fd, buf, syscall.MSG_DONTWAIT)
+		if err != nil || n <= 0 {
+			break
+		}
+		p := buf[:n]
+		if len(p) >= 9 && p[0] == 0x04 && p[1] == 0x3E && p[3] == 0x12 && p[5] == 0x01 {
+			terminated = true
+			if p[4] == 0x00 {
+				connHandle := binary.LittleEndian.Uint16(p[6:8]) & 0x0FFF
+				r.disconnectHandle(connHandle)
+			}
+		}
+	}
+	return terminated
+}
+
+func (r *Radio) holdExtAdv(hold time.Duration) {
+	fd := r.ensureEventFdLocked()
+	if fd < 0 {
+		time.Sleep(hold)
+		return
+	}
+
+	deadline := time.Now().Add(hold)
+	buf := make([]byte, 256)
+	for {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			return
+		}
+		_ = setRecvTimeout(fd, rem)
+		n, err := syscall.Read(fd, buf)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EINTR) {
+				if time.Until(deadline) <= 0 {
+					return
+				}
+				continue
+			}
+			time.Sleep(time.Until(deadline))
+			return
+		}
+		p := buf[:n]
+		// HCI_EV_LE_META (0x3E) -> subevent 0x12 (HCI_EV_LE_ADV_SET_TERM)
+		if len(p) >= 9 && p[0] == 0x04 && p[1] == 0x3E && p[3] == 0x12 && p[5] == 0x01 {
+			if p[4] == 0x00 {
+				connHandle := binary.LittleEndian.Uint16(p[6:8]) & 0x0FFF
+				r.disconnectHandle(connHandle)
+			}
+			if _, err := r.command(0x39, []byte{0x01, 0x01, 0x01, 0x00, 0x00, 0x00}, true); err != nil {
+				r.advActive = false
+			}
+		}
+	}
+}
+
+func (r *Radio) setupAdvSetLocked(ext bool) error {
+	if err := r.stopAdvertising(ext); err != nil {
+		return err
+	}
+	if !r.filterCleared {
+		_, _ = r.command(0x10, nil, true) // LE Clear Filter Accept List
+		r.filterCleared = true
+	}
+	if ext {
+		_ = r.ensureEventFdLocked()
+		if err := r.configureExtAdv(0x13, 0x03); err != nil {
+			_, _ = r.command(0x3C, []byte{0x01}, true)
+			if err2 := r.configureExtAdv(0x12, 0x00); err2 != nil {
+				return err
+			}
+		}
+	} else {
+		if _, err := r.command(0x05, r.revSender[:], false); err != nil {
+			return err
+		}
+		params := []byte{0x20, 0x00, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x03}
+		if _, err := r.command(0x06, params, false); err != nil {
+			return err
+		}
+		if _, err := r.command(0x09, make([]byte, 32), false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Advertise broadcasts each 31-byte BLE advertising payload for hold duration.
+// During rapid streaming, it keeps the advertising set active and updates the payload in-place.
 func (r *Radio) Advertise(ads [][]byte, hold time.Duration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.idleTimer != nil {
+		r.idleTimer.Stop()
+	}
 
 	if hold <= 0 {
 		hold = 450 * time.Millisecond
@@ -206,46 +396,16 @@ func (r *Radio) Advertise(ads [][]byte, hold time.Duration) error {
 	if err != nil {
 		return err
 	}
-	if err := r.stopAdvertising(ext); err != nil {
-		return err
+
+	if !r.advActive {
+		if err := r.setupAdvSetLocked(ext); err != nil {
+			return err
+		}
+	} else if ext && r.drainTermEventsLocked() {
+		r.advActive = false
 	}
 
-	var sender [6]byte
-	if _, err := rand.Read(sender[1:]); err != nil {
-		return err
-	}
-	sender[0] = 0xC2
-	revSender := [6]byte{sender[5], sender[4], sender[3], sender[2], sender[1], sender[0]}
-
-	if ext {
-		// LE Set Extended Advertising Parameters (handle 1, legacy connectable+scannable, random addr)
-		params := []byte{
-			0x01, 0x13, 0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0x00, 0x07,
-			0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-			0x01, 0x00, 0x01, 0x00, 0x00,
-		}
-		if _, err := r.command(0x36, params, false); err != nil {
-			return err
-		}
-		if _, err := r.command(0x35, append([]byte{0x01}, revSender[:]...), false); err != nil {
-			return err
-		}
-	} else {
-		if _, err := r.command(0x05, revSender[:], false); err != nil {
-			return err
-		}
-		params := []byte{0x20, 0x00, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00}
-		if _, err := r.command(0x06, params, false); err != nil {
-			return err
-		}
-		if _, err := r.command(0x09, make([]byte, 32), false); err != nil {
-			return err
-		}
-	}
-
-	defer func() {
-		_ = r.stopAdvertising(ext)
-	}()
+	defer r.scheduleIdleStopLocked(ext)
 
 	for _, ad := range ads {
 		if len(ad) > 31 {
@@ -259,11 +419,34 @@ func (r *Radio) Advertise(ads [][]byte, hold time.Duration) error {
 			dataCmd[3] = byte(len(ad))
 			copy(dataCmd[4:], ad)
 			if _, err := r.command(0x37, dataCmd, false); err != nil {
-				return err
+				// Re-setup set 1 if the controller lost state.
+				if errSetup := r.setupAdvSetLocked(true); errSetup != nil {
+					return err
+				}
+				if _, err2 := r.command(0x37, dataCmd, false); err2 != nil {
+					return err2
+				}
+				r.advActive = false
 			}
-			if _, err := r.command(0x39, []byte{0x01, 0x01, 0x01, 0x00, 0x00, 0x00}, false); err != nil {
-				return err
+			if !r.advActive {
+				if _, err := r.command(0x39, []byte{0x01, 0x01, 0x01, 0x00, 0x00, 0x00}, false); err != nil {
+					_ = r.stopAdvertising(true)
+					_, _ = r.command(0x3C, []byte{0x01}, true)
+					if errCfg := r.configureExtAdv(0x12, 0x00); errCfg != nil {
+						if errCfg2 := r.configureExtAdv(0x10, 0x00); errCfg2 != nil {
+							return err
+						}
+					}
+					if _, errData := r.command(0x37, dataCmd, false); errData != nil {
+						return errData
+					}
+					if _, errEn := r.command(0x39, []byte{0x01, 0x01, 0x01, 0x00, 0x00, 0x00}, false); errEn != nil {
+						return errEn
+					}
+				}
+				r.advActive = true
 			}
+			r.holdExtAdv(hold)
 		} else {
 			dataCmd := make([]byte, 32)
 			dataCmd[0] = byte(len(ad))
@@ -271,11 +454,14 @@ func (r *Radio) Advertise(ads [][]byte, hold time.Duration) error {
 			if _, err := r.command(0x08, dataCmd, false); err != nil {
 				return err
 			}
-			if _, err := r.command(0x0A, []byte{0x01}, false); err != nil {
-				return err
+			if !r.advActive {
+				if _, err := r.command(0x0A, []byte{0x01}, false); err != nil {
+					return err
+				}
+				r.advActive = true
 			}
+			time.Sleep(hold)
 		}
-		time.Sleep(hold)
 	}
 	return nil
 }
@@ -284,6 +470,10 @@ func (r *Radio) Advertise(ads [][]byte, hold time.Duration) error {
 func (r *Radio) Scan(ctx context.Context, onReport func(advData []byte) bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.idleTimer != nil {
+		r.idleTimer.Stop()
+	}
 
 	ext, err := r.detectMode()
 	if err != nil {

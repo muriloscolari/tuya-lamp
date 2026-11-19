@@ -79,6 +79,62 @@
       </div>
     </section>
 
+    <section class="card openrgb">
+      <div class="openrgb-head">
+        <div class="openrgb-title-wrap">
+          <span id="openrgb-dot" class="rgb-dot" title="Última cor recebida do OpenRGB"></span>
+          <div>
+            <h2>OpenRGB Sync (DDP)</h2>
+            <p id="openrgb-status" class="muted">Aguardando OpenRGB...</p>
+          </div>
+        </div>
+        <button id="openrgb-toggle" class="toggle-pill" type="button">Ativado</button>
+      </div>
+
+      <div class="field">
+        <div class="field-head">
+          <label for="openrgb-bright-range">Brilho máximo (OpenRGB)</label>
+          <span id="openrgb-bright-val" class="mono">100%</span>
+        </div>
+        <input id="openrgb-bright-range" type="range" min="10" max="100" value="100">
+      </div>
+
+      <div class="field">
+        <div class="field-head">
+          <label for="openrgb-interval-range">Intervalo BLE</label>
+          <span id="openrgb-interval-val" class="mono">40 ms (~25.0 Hz)</span>
+        </div>
+        <input id="openrgb-interval-range" type="range" min="20" max="500" step="5" value="40">
+      </div>
+
+      <div class="field">
+        <div class="field-head">
+          <span>No preto (#000)</span>
+        </div>
+        <div class="seg-group">
+          <button id="black-dim-btn" class="chip active" data-black="dim" type="button">Brilho mínimo (1%)</button>
+          <button id="black-off-btn" class="chip" data-black="off" type="button">Desligar</button>
+        </div>
+      </div>
+
+      <details class="openrgb-help">
+        <summary>Como conectar no OpenRGB</summary>
+        <div class="openrgb-help-body">
+          <p class="muted">No OpenRGB, vá em <strong>Configurações → Dispositivos DDP</strong> e adicione um dispositivo com:</p>
+          <div class="ddp-specs mono">
+            <span>IP: <strong id="ddp-spec-ip">127.0.0.1</strong></span>
+            <span>Porta: <strong id="ddp-spec-port">4048</strong></span>
+            <span>LEDs: <strong>1</strong></span>
+            <span>Keepalive: <strong>1000</strong></span>
+          </div>
+          <div class="setup-row">
+            <button id="openrgb-register-btn" class="btn secondary" type="button">Adicionar ao OpenRGB.json</button>
+            <span id="openrgb-register-status" class="muted"></span>
+          </div>
+        </div>
+      </details>
+    </section>
+
     <details class="card setup">
       <summary>Configuração &amp; Login Tuya (QR Code)</summary>
       <div class="setup-body">

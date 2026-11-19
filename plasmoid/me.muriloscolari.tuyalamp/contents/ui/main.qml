@@ -20,6 +20,10 @@ PlasmoidItem {
     property int lampTemp: 50
     property int lampHue: 270
     property int lampSat: 100
+    property bool openrgbEnabled: true
+    property bool openrgbConnected: false
+    property bool openrgbStreaming: false
+    property string openrgbListenAddr: ""
     property double dragLockUntil: 0
 
     preferredRepresentation: compactRepresentation
@@ -50,6 +54,14 @@ PlasmoidItem {
                 lampHue = data.state.hue !== undefined ? data.state.hue : 270
                 lampSat = data.state.sat !== undefined ? data.state.sat : 100
             }
+        }
+        if (data.openrgb) {
+            if (data.openrgb.config) {
+                openrgbEnabled = !!data.openrgb.config.enabled
+            }
+            openrgbConnected = !!data.openrgb.connected
+            openrgbStreaming = !!data.openrgb.streaming
+            openrgbListenAddr = data.openrgb.listen_addr || ""
         }
     }
 
@@ -84,6 +96,20 @@ PlasmoidItem {
         xhr.send(JSON.stringify(payload))
     }
 
+    function sendOpenRGB(payload) {
+        var xhr = new XMLHttpRequest()
+        xhr.open("POST", apiBase + "/api/openrgb", true)
+        xhr.setRequestHeader("Content-Type", "application/json")
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === XMLHttpRequest.DONE && xhr.status === 200) {
+                try {
+                    applyStatus(JSON.parse(xhr.responseText))
+                } catch (e) {}
+            }
+        }
+        xhr.send(JSON.stringify(payload))
+    }
+
     Timer {
         interval: root.expanded ? 1500 : 3500
         running: true
@@ -99,7 +125,7 @@ PlasmoidItem {
     toolTipMainText: lampName
     toolTipSubText: !daemonOnline ? "Backend offline (tuya-lampd)" :
                     (!configured ? "Não configurada" :
-                    (lampOn ? ("Ligada • Brilho " + lampBright + "%") : "Desligada"))
+                    (lampOn ? ("Ligada • Brilho " + lampBright + "%" + (openrgbStreaming ? " • OpenRGB Sync" : "")) : "Desligada"))
 
     compactRepresentation: MouseArea {
         id: compactRoot
@@ -352,6 +378,45 @@ PlasmoidItem {
                             }
                         }
                     }
+                }
+            }
+
+            Kirigami.Separator { Layout.fillWidth: true }
+
+            RowLayout {
+                Layout.fillWidth: true
+                enabled: root.daemonOnline && root.configured
+                spacing: Kirigami.Units.smallSpacing
+
+                Kirigami.Icon {
+                    source: "color-management"
+                    Layout.preferredWidth: 18
+                    Layout.preferredHeight: 18
+                    opacity: root.openrgbConnected ? 1.0 : 0.6
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    PlasmaComponents.Label {
+                        text: "OpenRGB Sync"
+                        font.bold: true
+                        Layout.fillWidth: true
+                    }
+                    PlasmaComponents.Label {
+                        text: root.openrgbStreaming ? "Sincronizando (DDP)" :
+                              (root.openrgbConnected ? (root.openrgbEnabled ? "OpenRGB conectado" : "OpenRGB conectado (pausado)") :
+                              (root.openrgbListenAddr !== "" ? ("Aguardando (" + root.openrgbListenAddr + ")") : "DDP offline"))
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        opacity: 0.7
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+                }
+
+                PlasmaComponents.Switch {
+                    checked: root.openrgbEnabled
+                    onToggled: root.sendOpenRGB({ enabled: !root.openrgbEnabled })
                 }
             }
 

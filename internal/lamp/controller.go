@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/muriloscolari/tuya-lamp/internal/ddp"
 	"github.com/muriloscolari/tuya-lamp/internal/p2"
 )
 
@@ -19,6 +21,11 @@ const (
 	DPBright byte = 3
 	DPTemp   byte = 4
 	DPColour byte = 11
+
+	seqLeaseStep       = 500
+	seqRotateThreshold = 65000
+	ddpConnectedWindow = 3 * time.Second
+	ddpStreamingWindow = 3 * time.Second
 )
 
 var NamedColors = map[string]int{
@@ -49,14 +56,34 @@ type Command struct {
 	Color  string `json:"color,omitempty"`
 }
 
+// OpenRGBStatus reports live DDP sync state and configuration.
+type OpenRGBStatus struct {
+	Config     OpenRGBConfig `json:"config"`
+	ListenAddr string        `json:"listen_addr,omitempty"`
+	Connected  bool          `json:"connected"`
+	Streaming  bool          `json:"streaming"`
+	LastRGB    [3]uint8      `json:"last_rgb"`
+	PacketsRx  uint64        `json:"packets_rx"`
+	FramesTx   uint64        `json:"frames_tx"`
+	LastError  string        `json:"last_error,omitempty"`
+}
+
 // Status is the full public status returned by the API.
 type Status struct {
-	Configured bool   `json:"configured"`
-	HasCapture bool   `json:"has_capture"`
-	Name       string `json:"name"`
-	Node       string `json:"node"`
-	State      State  `json:"state"`
-	LastError  string `json:"last_error,omitempty"`
+	Configured bool          `json:"configured"`
+	HasCapture bool          `json:"has_capture"`
+	Name       string        `json:"name"`
+	Node       string        `json:"node"`
+	State      State         `json:"state"`
+	LastError  string        `json:"last_error,omitempty"`
+	OpenRGB    OpenRGBStatus `json:"openrgb"`
+}
+
+type streamTarget struct {
+	hue  int
+	sat  int
+	val  int
+	dark bool
 }
 
 // Controller manages lamp state, keys, debounced BLE radio transmission, and SSE subscribers.
@@ -64,15 +91,39 @@ type Controller struct {
 	dir   string
 	radio Advertiser
 
-	mu         sync.Mutex
-	cfg        *Config
-	cap        *Capture
-	state      State
-	lastError  string
-	pending    [][]byte
-	txRunning  bool
-	notifyCh   chan struct{}
-	subs       map[chan Status]struct{}
+	mu                sync.Mutex
+	cfg               *Config
+	cap               *Capture
+	state             State
+	lastError         string
+	persistedSeq      uint16
+	openrgbCfg        OpenRGBConfig
+	openrgbListenAddr string
+	openrgbLastError  string
+	openrgbPacketsRx  uint64
+	openrgbFramesTx   uint64
+	hasLastDDP        bool
+	lastDDPRGB        [3]uint8
+	lastDDPAt         time.Time
+	lastDDPChangeAt   time.Time
+	pending           [][]byte
+	streamTarget      *streamTarget
+	hasStreamTx       bool
+	lastStreamHue     int
+	lastStreamSat     int
+	lastStreamVal     int
+	streamDark        bool
+	lastStreamTx      time.Time
+	manualHoldUntil   time.Time
+	lastStatePersist  time.Time
+	lastSSEBroadcast  time.Time
+	idleTimer         *time.Timer
+	closed            bool
+	notifyCh          chan struct{}
+	stopCh            chan struct{}
+	txDone            chan struct{}
+	closeOnce         sync.Once
+	subs              map[chan Status]struct{}
 }
 
 // NewController loads config/state from dir and starts the background BLE transmitter.
@@ -80,11 +131,14 @@ func NewController(dir string, radio Advertiser) (*Controller, error) {
 	MaybeImportLegacy(dir)
 
 	c := &Controller{
-		dir:      dir,
-		radio:    radio,
-		state:    DefaultState(),
-		notifyCh: make(chan struct{}, 1),
-		subs:     make(map[chan Status]struct{}),
+		dir:        dir,
+		radio:      radio,
+		state:      DefaultState(),
+		openrgbCfg: DefaultOpenRGBConfig(),
+		notifyCh:   make(chan struct{}, 1),
+		stopCh:     make(chan struct{}),
+		txDone:     make(chan struct{}),
+		subs:       make(map[chan Status]struct{}),
 	}
 
 	var cfg Config
@@ -99,6 +153,7 @@ func NewController(dir string, radio Advertiser) (*Controller, error) {
 			cfg.Name = "Zinnia Crux CR90"
 		}
 		c.cfg = &cfg
+		c.persistedSeq = cfg.Seq
 	}
 
 	var capData Capture
@@ -120,6 +175,12 @@ func NewController(dir string, radio Advertiser) (*Controller, error) {
 		c.state = st
 	}
 
+	var ocfg OpenRGBConfig
+	if err := readJSON(filepath.Join(dir, "openrgb.json"), &ocfg); err == nil {
+		ocfg.Normalize()
+		c.openrgbCfg = ocfg
+	}
+
 	go c.txLoop()
 	return c, nil
 }
@@ -131,13 +192,35 @@ func (c *Controller) Status() Status {
 	return c.statusLocked()
 }
 
+func (c *Controller) isConnectedLocked(now time.Time) bool {
+	return !c.lastDDPAt.IsZero() && now.Sub(c.lastDDPAt) < ddpConnectedWindow
+}
+
+func (c *Controller) isStreamingLocked(now time.Time) bool {
+	return c.openrgbCfg.Enabled &&
+		c.isConnectedLocked(now) &&
+		!c.lastDDPChangeAt.IsZero() &&
+		now.Sub(c.lastDDPChangeAt) < ddpStreamingWindow
+}
+
 func (c *Controller) statusLocked() Status {
+	now := time.Now()
 	s := Status{
 		Configured: c.cfg != nil,
 		HasCapture: c.cap != nil,
 		Name:       "Zinnia Crux CR90",
 		State:      c.state,
 		LastError:  c.lastError,
+		OpenRGB: OpenRGBStatus{
+			Config:     c.openrgbCfg,
+			ListenAddr: c.openrgbListenAddr,
+			Connected:  c.isConnectedLocked(now),
+			Streaming:  c.isStreamingLocked(now),
+			LastRGB:    c.lastDDPRGB,
+			PacketsRx:  c.openrgbPacketsRx,
+			FramesTx:   c.openrgbFramesTx,
+			LastError:  c.openrgbLastError,
+		},
 	}
 	if c.cfg != nil {
 		if c.cfg.Name != "" {
@@ -213,6 +296,7 @@ func (c *Controller) SaveConfig(cfg Config) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cfg = &cfg
+	c.persistedSeq = cfg.Seq
 	if err := writeJSONAtomic(filepath.Join(c.dir, "config.json"), &cfg, 0o600); err != nil {
 		return err
 	}
@@ -280,6 +364,21 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func hueDiff(a, b int) int {
+	d := absInt(a - b)
+	if d > 180 {
+		d = 360 - d
+	}
+	return d
+}
+
 func encodeBright(pct int) []byte {
 	v := 10 + int(float64(clamp(pct, 1, 100)-1)/99.0*990.0+0.5)
 	var b [4]byte
@@ -303,6 +402,233 @@ func encodeColour(hue, sat, val int) []byte {
 	return b[:]
 }
 
+func (c *Controller) broadcastThrottledLocked(now time.Time, force bool) {
+	if !force && now.Sub(c.lastSSEBroadcast) < 100*time.Millisecond {
+		return
+	}
+	c.lastSSEBroadcast = now
+	c.broadcastLocked()
+}
+
+func (c *Controller) resetIdleTimerLocked() {
+	if c.closed {
+		return
+	}
+	if c.idleTimer != nil {
+		c.idleTimer.Stop()
+	}
+	c.idleTimer = time.AfterFunc(3200*time.Millisecond, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.closed {
+			return
+		}
+		c.broadcastLocked()
+	})
+}
+
+func (c *Controller) allocSeqLocked(count int, persistNow bool) ([2]byte, uint16, error) {
+	var src [2]byte
+	if c.cfg == nil {
+		return src, 0, errors.New("lamp not configured yet (run login/setup first)")
+	}
+	srcVal := uint16(0x8001)
+	if c.cfg.Src != "" {
+		if b, err := hex.DecodeString(c.cfg.Src); err == nil && len(b) == 2 {
+			srcVal = binary.BigEndian.Uint16(b)
+		}
+	}
+
+	if int(c.cfg.Seq)+count >= seqRotateThreshold {
+		if srcVal < 0x8001 || srcVal >= 0xFFFE {
+			srcVal = 0x8001
+		} else {
+			srcVal++
+		}
+		c.cfg.Src = fmt.Sprintf("%04x", srcVal)
+		c.cfg.Seq = 10
+		c.persistedSeq = 10
+		persistNow = true
+	}
+
+	binary.BigEndian.PutUint16(src[:], srcVal)
+	startSeq := c.cfg.Seq + 1
+	c.cfg.Seq += uint16(count)
+
+	if persistNow {
+		if c.cfg.Seq > c.persistedSeq {
+			c.persistedSeq = c.cfg.Seq
+		}
+		cfgCopy := *c.cfg
+		cfgCopy.Seq = c.persistedSeq
+		_ = writeJSONAtomic(filepath.Join(c.dir, "config.json"), &cfgCopy, 0o600)
+	} else if c.cfg.Seq > c.persistedSeq {
+		nextLease := int(c.cfg.Seq) + seqLeaseStep
+		if nextLease >= seqRotateThreshold {
+			nextLease = seqRotateThreshold - 1
+		}
+		c.persistedSeq = uint16(nextLease)
+		cfgCopy := *c.cfg
+		cfgCopy.Seq = c.persistedSeq
+		_ = writeJSONAtomic(filepath.Join(c.dir, "config.json"), &cfgCopy, 0o600)
+	}
+
+	return src, startSeq, nil
+}
+
+func (c *Controller) buildAdsLocked(payloads [][]byte, persistNow bool) ([][]byte, error) {
+	if len(payloads) == 0 {
+		return nil, nil
+	}
+	if c.cfg == nil {
+		return nil, errors.New("lamp not configured yet (run login/setup first)")
+	}
+	localKey, err := p2.KeyFromString(c.cfg.LocalKey)
+	if err != nil {
+		return nil, err
+	}
+	beaconKey, err := hex.DecodeString(c.cfg.BeaconKey)
+	if err != nil || len(beaconKey) != 16 {
+		return nil, errors.New("invalid beacon_key")
+	}
+	dstSlice, err := hex.DecodeString(c.cfg.Dst)
+	if err != nil || len(dstSlice) != 2 {
+		return nil, errors.New("invalid dst address")
+	}
+	var dst [2]byte
+	copy(dst[:], dstSlice)
+
+	src, startSeq, err := c.allocSeqLocked(len(payloads), persistNow)
+	if err != nil {
+		return nil, err
+	}
+
+	ads := make([][]byte, 0, len(payloads))
+	for i, pl := range payloads {
+		frame, err := p2.BuildFrame(src, dst, startSeq+uint16(i), pl, localKey, beaconKey)
+		if err != nil {
+			return nil, err
+		}
+		ads = append(ads, p2.Advertisement(frame))
+	}
+	return ads, nil
+}
+
+// SetOpenRGBListen records the UDP listen address and any startup bind error for DDP.
+func (c *Controller) SetOpenRGBListen(addr, errMsg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.openrgbListenAddr = addr
+	c.openrgbLastError = errMsg
+	c.broadcastLocked()
+}
+
+// SetOpenRGBConfig applies partial updates to the OpenRGB sync configuration.
+func (c *Controller) SetOpenRGBConfig(patch OpenRGBConfigPatch) (Status, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if patch.Enabled != nil {
+		c.openrgbCfg.Enabled = *patch.Enabled
+		if *patch.Enabled {
+			c.hasStreamTx = false
+			c.hasLastDDP = false
+			c.manualHoldUntil = time.Time{}
+		} else {
+			c.streamTarget = nil
+			c.streamDark = false
+		}
+	}
+	if patch.MaxBright != nil {
+		c.openrgbCfg.MaxBright = *patch.MaxBright
+	}
+	if patch.MinIntervalMs != nil {
+		c.openrgbCfg.MinIntervalMs = *patch.MinIntervalMs
+	}
+	if patch.HoldMs != nil {
+		c.openrgbCfg.HoldMs = *patch.HoldMs
+	}
+	if patch.BlackMode != nil {
+		c.openrgbCfg.BlackMode = *patch.BlackMode
+	}
+	c.openrgbCfg.Normalize()
+
+	if err := writeJSONAtomic(filepath.Join(c.dir, "openrgb.json"), &c.openrgbCfg, 0o644); err != nil {
+		return Status{}, err
+	}
+	st := c.statusLocked()
+	c.broadcastLocked()
+	return st, nil
+}
+
+// HandleDDP processes a single incoming RGB color frame from OpenRGB over DDP.
+func (c *Controller) HandleDDP(r, g, b uint8) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return
+	}
+
+	now := time.Now()
+	c.openrgbPacketsRx++
+	wasConnected := c.isConnectedLocked(now)
+	wasStreaming := c.isStreamingLocked(now)
+	c.lastDDPAt = now
+
+	rgb := [3]uint8{r, g, b}
+	same := c.hasLastDDP && c.lastDDPRGB == rgb
+	c.lastDDPRGB = rgb
+	c.hasLastDDP = true
+
+	c.resetIdleTimerLocked()
+
+	if same {
+		if !wasConnected {
+			c.broadcastThrottledLocked(now, true)
+		}
+		return
+	}
+
+	c.lastDDPChangeAt = now
+	if !c.openrgbCfg.Enabled || c.cfg == nil || !c.state.On || now.Before(c.manualHoldUntil) {
+		if !wasConnected || !wasStreaming {
+			c.broadcastThrottledLocked(now, false)
+		}
+		return
+	}
+
+	if r == 0 && g == 0 && b == 0 {
+		if c.openrgbCfg.BlackMode == "off" {
+			c.streamTarget = &streamTarget{dark: true}
+		} else {
+			c.streamTarget = &streamTarget{
+				hue:  c.state.Hue,
+				sat:  c.state.Sat,
+				val:  1,
+				dark: false,
+			}
+		}
+	} else {
+		h, s, v := ddp.RGBToHSV(r, g, b)
+		v = clamp(int(math.Round(float64(v)*float64(c.openrgbCfg.MaxBright)/100.0)), 1, 100)
+		if s < 8 {
+			h = c.state.Hue
+		}
+		c.streamTarget = &streamTarget{
+			hue:  h,
+			sat:  s,
+			val:  v,
+			dark: false,
+		}
+	}
+
+	select {
+	case c.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
 // Apply updates lamp state and queues the corresponding P2 BLE frame(s).
 // If sync is true, it waits for the radio transmission to finish (used by CLI).
 func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
@@ -312,36 +638,25 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 		return Status{}, errors.New("lamp not configured yet (run login/setup first)")
 	}
 
-	localKey, err := p2.KeyFromString(c.cfg.LocalKey)
-	if err != nil {
-		c.mu.Unlock()
-		return Status{}, err
-	}
-	beaconKey, err := hex.DecodeString(c.cfg.BeaconKey)
-	if err != nil {
-		c.mu.Unlock()
-		return Status{}, err
-	}
-	dstSlice, _ := hex.DecodeString(c.cfg.Dst)
-	srcSlice, _ := hex.DecodeString(c.cfg.Src)
-	var src, dst [2]byte
-	copy(src[:], srcSlice)
-	copy(dst[:], dstSlice)
-
 	var payloads [][]byte
 	action := strings.ToLower(strings.TrimSpace(cmd.Action))
+	turningOff := false
+	modifiesColorOrMode := false
+
 	switch action {
 	case "on":
 		c.state.On = true
 		payloads = append(payloads, p2.PayloadON)
 	case "off":
 		c.state.On = false
+		turningOff = true
 		payloads = append(payloads, p2.PayloadOFF)
 	case "toggle":
 		c.state.On = !c.state.On
 		if c.state.On {
 			payloads = append(payloads, p2.PayloadON)
 		} else {
+			turningOff = true
 			payloads = append(payloads, p2.PayloadOFF)
 		}
 	case "bright":
@@ -349,6 +664,7 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 			c.mu.Unlock()
 			return Status{}, errors.New("bright requires value 1-100")
 		}
+		modifiesColorOrMode = true
 		c.state.Bright = clamp(*cmd.Bright, 1, 100)
 		if c.state.Mode == "color" {
 			payloads = append(payloads, p2.MustDPPayload([]p2.DP{
@@ -366,6 +682,7 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 			c.mu.Unlock()
 			return Status{}, errors.New("temp requires value 0-100")
 		}
+		modifiesColorOrMode = true
 		c.state.Mode = "white"
 		c.state.Temp = clamp(*cmd.Temp, 0, 100)
 		payloads = append(payloads, p2.MustDPPayload([]p2.DP{
@@ -373,6 +690,7 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 			{ID: DPTemp, Type: p2.DPTypeValue, Value: encodeTemp(c.state.Temp)},
 		}))
 	case "white":
+		modifiesColorOrMode = true
 		c.state.Mode = "white"
 		if cmd.Bright != nil {
 			c.state.Bright = clamp(*cmd.Bright, 1, 100)
@@ -382,6 +700,7 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 			{ID: DPBright, Type: p2.DPTypeValue, Value: encodeBright(c.state.Bright)},
 		}))
 	case "color":
+		modifiesColorOrMode = true
 		hue := c.state.Hue
 		if cmd.Color != "" {
 			if h, ok := NamedColors[strings.ToLower(cmd.Color)]; ok {
@@ -416,8 +735,12 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 			if c.state.On {
 				payloads = append(payloads, p2.PayloadON)
 			} else {
+				turningOff = true
 				payloads = append(payloads, p2.PayloadOFF)
 			}
+		}
+		if cmd.Mode == "white" || cmd.Mode == "color" || cmd.Bright != nil || cmd.Temp != nil || cmd.Hue != nil || cmd.Sat != nil {
+			modifiesColorOrMode = true
 		}
 		if cmd.Mode == "white" || cmd.Mode == "color" {
 			c.state.Mode = cmd.Mode
@@ -455,19 +778,24 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 		return Status{}, fmt.Errorf("unknown action %q", cmd.Action)
 	}
 
-	ads := make([][]byte, 0, len(payloads))
-	for _, pl := range payloads {
-		c.cfg.Seq++
-		frame, err := p2.BuildFrame(src, dst, c.cfg.Seq, pl, localKey, beaconKey)
-		if err != nil {
-			c.mu.Unlock()
-			return Status{}, err
-		}
-		ads = append(ads, p2.Advertisement(frame))
+	ads, err := c.buildAdsLocked(payloads, true)
+	if err != nil {
+		c.mu.Unlock()
+		return Status{}, err
 	}
 
-	_ = writeJSONAtomic(filepath.Join(c.dir, "config.json"), c.cfg, 0o600)
+	c.streamDark = false
+	c.hasStreamTx = false
+	c.hasLastDDP = false
+	if turningOff || modifiesColorOrMode {
+		c.streamTarget = nil
+	}
+	if modifiesColorOrMode {
+		c.manualHoldUntil = time.Now().Add(3 * time.Second)
+	}
+
 	_ = writeJSONAtomic(filepath.Join(c.dir, "state.json"), &c.state, 0o644)
+	c.lastStatePersist = time.Now()
 	c.lastError = ""
 	st := c.statusLocked()
 	c.broadcastLocked()
@@ -498,24 +826,236 @@ func (c *Controller) Apply(cmd Command, syncTx bool) (Status, error) {
 	return st, nil
 }
 
+func (c *Controller) buildStreamAdsLocked(target streamTarget) ([][]byte, time.Duration, error) {
+	var payloads [][]byte
+	if target.dark {
+		payloads = append(payloads, p2.PayloadOFF)
+	} else {
+		if c.streamDark {
+			payloads = append(payloads, p2.PayloadON)
+		}
+		if target.sat < 10 {
+			payloads = append(payloads, p2.MustDPPayload([]p2.DP{
+				{ID: DPMode, Type: p2.DPTypeEnum, Value: []byte{0}},
+				{ID: DPBright, Type: p2.DPTypeValue, Value: encodeBright(target.val)},
+			}))
+		} else {
+			payloads = append(payloads, p2.MustDPPayload([]p2.DP{
+				{ID: DPMode, Type: p2.DPTypeEnum, Value: []byte{1}},
+				{ID: DPColour, Type: p2.DPTypeRaw, Value: encodeColour(target.hue, target.sat, target.val)},
+			}))
+		}
+	}
+
+	ads, err := c.buildAdsLocked(payloads, false)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	c.lastStreamTx = time.Now()
+	hold := time.Duration(clamp(c.openrgbCfg.HoldMs, 15, 450)) * time.Millisecond
+	return ads, hold, nil
+}
+
+func (c *Controller) commitStreamTxLocked(target streamTarget, adCount int) {
+	if target.dark {
+		c.streamDark = true
+		c.hasStreamTx = true
+	} else {
+		if target.sat < 10 {
+			c.state.Mode = "white"
+		} else {
+			c.state.Mode = "color"
+			c.state.Hue = target.hue
+		}
+		c.state.Sat = target.sat
+		c.state.Bright = target.val
+		c.lastStreamHue = target.hue
+		c.lastStreamSat = target.sat
+		c.lastStreamVal = target.val
+		c.hasStreamTx = true
+		c.streamDark = false
+	}
+
+	now := time.Now()
+	c.openrgbFramesTx += uint64(adCount)
+	c.lastError = ""
+
+	if now.Sub(c.lastStatePersist) >= 5*time.Second {
+		_ = writeJSONAtomic(filepath.Join(c.dir, "state.json"), &c.state, 0o644)
+		c.lastStatePersist = now
+	}
+	c.broadcastThrottledLocked(now, false)
+}
+
 func (c *Controller) txLoop() {
-	for range c.notifyCh {
-		// Short debounce window so rapid slider drags coalesce into one BLE burst.
-		time.Sleep(80 * time.Millisecond)
+	defer close(c.txDone)
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-c.notifyCh:
+		}
+
 		for {
+			select {
+			case <-c.stopCh:
+				return
+			default:
+			}
+
 			c.mu.Lock()
-			ads := c.pending
-			c.pending = nil
+			hasPending := len(c.pending) > 0
+			hasStream := c.streamTarget != nil
 			c.mu.Unlock()
-			if len(ads) == 0 || c.radio == nil {
+
+			if hasPending {
+				// Short debounce window so rapid slider drags coalesce into one BLE burst.
+				timer := time.NewTimer(80 * time.Millisecond)
+				select {
+				case <-c.stopCh:
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+
+				c.mu.Lock()
+				ads := c.pending
+				c.pending = nil
+				rad := c.radio
+				c.mu.Unlock()
+
+				if len(ads) > 0 && rad != nil {
+					if err := rad.Advertise(ads, 450*time.Millisecond); err != nil {
+						c.mu.Lock()
+						c.lastError = err.Error()
+						c.broadcastLocked()
+						c.mu.Unlock()
+					}
+				}
+				continue
+			}
+
+			if !hasStream {
 				break
 			}
-			if err := c.radio.Advertise(ads, 450*time.Millisecond); err != nil {
-				c.mu.Lock()
+
+			c.mu.Lock()
+			rem := time.Duration(c.openrgbCfg.MinIntervalMs)*time.Millisecond - time.Since(c.lastStreamTx)
+			c.mu.Unlock()
+
+			if rem > 0 {
+				timer := time.NewTimer(rem)
+				interruptedByPending := false
+			waitLoop:
+				for {
+					select {
+					case <-c.stopCh:
+						timer.Stop()
+						return
+					case <-timer.C:
+						break waitLoop
+					case <-c.notifyCh:
+						c.mu.Lock()
+						if len(c.pending) > 0 {
+							interruptedByPending = true
+						}
+						c.mu.Unlock()
+						if interruptedByPending {
+							timer.Stop()
+							break waitLoop
+						}
+					}
+				}
+				if interruptedByPending {
+					continue
+				}
+			}
+
+			c.mu.Lock()
+			if len(c.pending) > 0 {
+				c.mu.Unlock()
+				continue
+			}
+			target := c.streamTarget
+			c.streamTarget = nil
+			if target == nil || !c.openrgbCfg.Enabled || !c.state.On || c.cfg == nil {
+				c.mu.Unlock()
+				continue
+			}
+
+			if c.hasStreamTx && target.dark == c.streamDark {
+				if target.dark {
+					c.mu.Unlock()
+					continue
+				}
+				targetMode := "color"
+				if target.sat < 10 {
+					targetMode = "white"
+				}
+				if c.state.Mode == targetMode {
+					dH := hueDiff(target.hue, c.lastStreamHue)
+					if targetMode == "white" {
+						dH = 0
+					}
+					dS := absInt(target.sat - c.lastStreamSat)
+					dV := absInt(target.val - c.lastStreamVal)
+					if dH < 2 && dS < 2 && dV < 2 {
+						c.mu.Unlock()
+						continue
+					}
+				}
+			}
+
+			ads, hold, err := c.buildStreamAdsLocked(*target)
+			if err != nil {
 				c.lastError = err.Error()
 				c.broadcastLocked()
 				c.mu.Unlock()
+				continue
 			}
+			rad := c.radio
+			c.mu.Unlock()
+
+			if len(ads) > 0 && rad != nil {
+				if err := rad.Advertise(ads, hold); err != nil {
+					c.mu.Lock()
+					c.lastError = err.Error()
+					c.hasLastDDP = false
+					c.broadcastLocked()
+					c.mu.Unlock()
+					continue
+				}
+			}
+			c.mu.Lock()
+			c.commitStreamTxLocked(*target, len(ads))
+			c.mu.Unlock()
 		}
 	}
+}
+
+// Close stops the background transmitter and flushes persisted config and state.
+func (c *Controller) Close() {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		if c.idleTimer != nil {
+			c.idleTimer.Stop()
+		}
+		c.mu.Unlock()
+
+		close(c.stopCh)
+		<-c.txDone
+
+		c.mu.Lock()
+		if c.cfg != nil {
+			cfgCopy := *c.cfg
+			if c.persistedSeq > cfgCopy.Seq {
+				cfgCopy.Seq = c.persistedSeq
+			}
+			_ = writeJSONAtomic(filepath.Join(c.dir, "config.json"), &cfgCopy, 0o600)
+		}
+		_ = writeJSONAtomic(filepath.Join(c.dir, "state.json"), &c.state, 0o644)
+		c.mu.Unlock()
+	})
 }

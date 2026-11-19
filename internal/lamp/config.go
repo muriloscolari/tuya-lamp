@@ -44,6 +44,60 @@ func DefaultState() State {
 	}
 }
 
+// OpenRGBConfig controls how incoming OpenRGB DDP frames synchronize with the lamp.
+type OpenRGBConfig struct {
+	Enabled       bool   `json:"enabled"`
+	MaxBright     int    `json:"max_bright"`      // 10..100, default 100
+	MinIntervalMs int    `json:"min_interval_ms"` // 20..1000, default 40
+	HoldMs        int    `json:"hold_ms"`         // 15..450, default 30
+	BlackMode     string `json:"black_mode"`      // "dim" or "off", default "dim"
+}
+
+// OpenRGBConfigPatch represents partial updates to OpenRGBConfig.
+type OpenRGBConfigPatch struct {
+	Enabled       *bool   `json:"enabled,omitempty"`
+	MaxBright     *int    `json:"max_bright,omitempty"`
+	MinIntervalMs *int    `json:"min_interval_ms,omitempty"`
+	HoldMs        *int    `json:"hold_ms,omitempty"`
+	BlackMode     *string `json:"black_mode,omitempty"`
+}
+
+// DefaultOpenRGBConfig returns the default OpenRGB DDP synchronization configuration.
+func DefaultOpenRGBConfig() OpenRGBConfig {
+	return OpenRGBConfig{
+		Enabled:       true,
+		MaxBright:     100,
+		MinIntervalMs: 40,
+		HoldMs:        30,
+		BlackMode:     "dim",
+	}
+}
+
+// Normalize clamps and fills missing fields in OpenRGBConfig.
+func (o *OpenRGBConfig) Normalize() {
+	if o.MaxBright == 0 {
+		o.MaxBright = 100
+	} else {
+		o.MaxBright = clamp(o.MaxBright, 10, 100)
+	}
+	if o.MinIntervalMs == 0 {
+		o.MinIntervalMs = 40
+	} else {
+		o.MinIntervalMs = clamp(o.MinIntervalMs, 20, 1000)
+	}
+	if o.HoldMs == 0 {
+		o.HoldMs = 30
+	} else {
+		o.HoldMs = clamp(o.HoldMs, 15, 450)
+	}
+	if o.HoldMs > o.MinIntervalMs-5 {
+		o.HoldMs = clamp(o.MinIntervalMs-5, 15, 450)
+	}
+	if o.BlackMode != "off" {
+		o.BlackMode = "dim"
+	}
+}
+
 // ConfigDir returns ~/.config/tuya-lamp (or $TUYA_LAMP_CONFIG_DIR).
 func ConfigDir() (string, error) {
 	if env := os.Getenv("TUYA_LAMP_CONFIG_DIR"); env != "" {

@@ -1,5 +1,5 @@
 [Unit]
-Description=Tuya Lamp Daemon (Tuya Beacon P2 + HTTP/Web UI)
+Description=Tuya Lamp Daemon (Tuya Beacon P2 + HTTP/Web UI + OpenRGB DDP)
 After=bluetooth.target network.target
 Wants=bluetooth.target
 
