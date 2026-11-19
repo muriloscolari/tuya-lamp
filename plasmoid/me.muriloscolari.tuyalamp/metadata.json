@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Murilo Scolari"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Controle local Bluetooth (Tuya Beacon) para lâmpada Zinnia Crux CR90",
+        "Icon": "lightbulb",
+        "Id": "me.muriloscolari.tuyalamp",
+        "License": "MIT",
+        "Name": "Tuya Lamp",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

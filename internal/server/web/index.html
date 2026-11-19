@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tuya Lamp — Zinnia Crux CR90</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="container">
+    <header class="card header">
+      <div class="title-wrap">
+        <div id="bulb-orb" class="orb"></div>
+        <div>
+          <h1 id="lamp-name">Zinnia Crux CR90</h1>
+          <p id="lamp-meta" class="muted">Conectando...</p>
+        </div>
+      </div>
+      <button id="power-btn" class="power-btn" type="button" aria-label="Ligar ou desligar">
+        <span id="power-label">Ligar</span>
+      </button>
+    </header>
+
+    <section class="card controls">
+      <div class="tabs" role="tablist">
+        <button id="tab-white" class="tab active" type="button">Branco</button>
+        <button id="tab-color" class="tab" type="button">Cor (RGB)</button>
+      </div>
+
+      <div class="field">
+        <div class="field-head">
+          <label for="bright-range">Brilho</label>
+          <span id="bright-val" class="mono">100%</span>
+        </div>
+        <input id="bright-range" type="range" min="1" max="100" value="100">
+      </div>
+
+      <div id="panel-white" class="panel">
+        <div class="field">
+          <div class="field-head">
+            <label for="temp-range">Temperatura</label>
+            <span id="temp-val" class="mono">Neutro (50%)</span>
+          </div>
+          <input id="temp-range" class="temp-slider" type="range" min="0" max="100" value="50">
+        </div>
+        <div class="presets">
+          <button class="chip" data-white="40,15" type="button">Relaxar</button>
+          <button class="chip" data-white="85,55" type="button">Leitura</button>
+          <button class="chip" data-white="100,100" type="button">Foco</button>
+        </div>
+      </div>
+
+      <div id="panel-color" class="panel hidden">
+        <div class="field">
+          <div class="field-head">
+            <label for="hue-range">Matiz (Hue)</label>
+            <span id="hue-val" class="mono">270°</span>
+          </div>
+          <input id="hue-range" class="hue-slider" type="range" min="0" max="359" value="270">
+        </div>
+        <div class="field">
+          <div class="field-head">
+            <label for="sat-range">Saturação</label>
+            <span id="sat-val" class="mono">100%</span>
+          </div>
+          <input id="sat-range" type="range" min="0" max="100" value="100">
+        </div>
+        <div class="swatches">
+          <button class="swatch" data-hue="0" style="--c:#ff3b30" title="Vermelho" type="button"></button>
+          <button class="swatch" data-hue="30" style="--c:#ff9500" title="Laranja" type="button"></button>
+          <button class="swatch" data-hue="60" style="--c:#ffcc00" title="Amarelo" type="button"></button>
+          <button class="swatch" data-hue="120" style="--c:#34c759" title="Verde" type="button"></button>
+          <button class="swatch" data-hue="180" style="--c:#32ade6" title="Ciano" type="button"></button>
+          <button class="swatch" data-hue="240" style="--c:#007aff" title="Azul" type="button"></button>
+          <button class="swatch" data-hue="270" style="--c:#af52de" title="Roxo" type="button"></button>
+          <button class="swatch" data-hue="330" style="--c:#ff2d55" title="Rosa" type="button"></button>
+        </div>
+      </div>
+    </section>
+
+    <details class="card setup">
+      <summary>Configuração &amp; Login Tuya (QR Code)</summary>
+      <div class="setup-body">
+        <p class="muted">Use esta seção apenas se precisar parear outra lâmpada ou recuperar as chaves novamente.</p>
+        <div class="setup-row">
+          <button id="capture-btn" class="btn secondary" type="button">1. Capturar OFF/ON do celular (45s)</button>
+          <span id="capture-status" class="muted"></span>
+        </div>
+        <div class="setup-row">
+          <input id="user-code" type="text" placeholder="Código do Usuário (App: Eu → Config → Conta)">
+          <button id="qr-btn" class="btn" type="button">2. Gerar QR Login</button>
+        </div>
+        <div id="qr-box" class="qr-box hidden">
+          <img id="qr-img" alt="QR Code Tuya Login">
+          <p id="qr-status" class="muted">Escaneie no app Tuya/Smart Life (Eu → ícone de scanner) e confirme.</p>
+        </div>
+      </div>
+    </details>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

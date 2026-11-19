@@ -1,0 +1,19 @@
+[Unit]
+Description=Tuya Lamp Daemon (Tuya Beacon P2 + HTTP/Web UI)
+After=bluetooth.target network.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_BLUETOOTH
+ExecStart=/usr/local/bin/tuya-lampd serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
